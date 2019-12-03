@@ -1,4 +1,3 @@
-Learn more or give us feedback
 from ..poop.protocol import POOP
 from playground.network.common import StackingProtocolFactory, StackingProtocol, StackingTransport
 import logging

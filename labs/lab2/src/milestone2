@@ -75,20 +75,20 @@ class CrapTransport(StackingTransport):
         self.protocol = protocol
 
     def write(self, data):
-        if self.mode == "client":
+        if self.protocol._mode == "client":
             aesgcm = AESGCM(self.encA)
-            encDataA = aesgcm.encrypt(self.ivA, data, None)
-            self.ivA = (int.from_bytes(self.ivA, "big") + 1).to_bytes(12, "big")
+            encDataA = aesgcm.encrypt(self.protocol.ivA, data, None)
+            self.protocol.ivA = (int.from_bytes(self.protocol.ivA, "big") + 1).to_bytes(12, "big")
             new_packet = DataPacket(data=encDataA)
-            self.transport.write(new_packet.__serialize__())
+            self.protocol.transport.write(new_packet.__serialize__())
             print("Client send encrypted data")
 
-        if self.mode == "server":
-            aesgcm = AESGCM(self.encB)
-            encDataB = aesgcm.encrypt(self.ivB, data, None)
-            self.ivB = (int.from_bytes(self.ivB, "big") + 1).to_bytes(12, "big")
+        if self.protocol._mode == "server":
+            aesgcm = AESGCM(self.protocol.encB)
+            encDataB = aesgcm.encrypt(self.protocol.ivB, data, None)
+            self.protocol.ivB = (int.from_bytes(self.protocol.ivB, "big") + 1).to_bytes(12, "big")
             new_packet = DataPacket(data=encDataB)
-            self.transport.write(new_packet.__serialize__())
+            self.protocol.transport.write(new_packet.__serialize__())
             print("server send encrypted data")
 
     def close(self):
@@ -188,13 +188,28 @@ class CRAP(StackingProtocol):
                     if pkt.status == 0:
                         client_certification = x509.load_pem_x509_certificate(pkt.cert, default_backend())
                         Upper_certification = x509.load_pem_x509_certificate(pkt.certChain[0], default_backend())
+                        lower_certification = x509.load_pem_x509_certificate(pkt.certChain[-1], default_backend())
 
                         if(Upper_certification.issuer != self.root_CA_cert.issuer):
-                            #Upper_certification.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
                             print("Upper_cert is not signed by a trusted root CA!")
                             return
 
+                        lower_commonname = lower_certification.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+                        client_commonname = client_certification.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+                        print(lower_commonname)
+                        print(client_commonname)
+
+                        if lower_commonname[0:6] != client_commonname[0:6]:
+                            print("client certification is not signed by a trust lower_CA according to the rules!")
+                            return
+                        print(self.transport.get_extra_info('peername'))
+
+                        if client_commonname != self.transport.get_extra_info('peername')[0]:
+                            print("client common name check failed because this is a wrong common name")
+                            return
+
                         self.cert_pubkA = client_certification.public_key()
+
                         try:
                             self.cert_pubkA.verify(pkt.signature, pkt.pk,
                                                  padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
@@ -221,13 +236,14 @@ class CRAP(StackingProtocol):
                         #generate shared_key
                         recv_pbk = load_pem_public_key(pkt.pk, backend=default_backend())
                         self.shared_key = self.server_private_key.exchange(ec.ECDH(), recv_pbk)
-                        
+
                         data = self.server_public_key.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo)
                         sigB = self.server_sign_pvk.sign(data, padding.PSS(mgf=padding.MGF1(hashes.SHA256()),salt_length=padding.PSS.MAX_LENGTH),hashes.SHA256())
                         tls_handshake_packet = HandshakePacket(status=1)
                         tls_handshake_packet.pk = data
                         tls_handshake_packet.signature = sigB
                         tls_handshake_packet.nonce = self.snonce
+
 
                         builder = x509.CertificateBuilder()
                         builder = builder.subject_name(
@@ -267,6 +283,7 @@ class CRAP(StackingProtocol):
                             self.transport.close()
                         print("Server TLS Handshake complete")
 
+                        # Create hash 1, IVA, IVB
                         digest1 = hashes.Hash(hashes.SHA256(), backend=default_backend())
                         digest1.update(self.shared_key)
                         hash1 = digest1.finalize()
@@ -275,12 +292,14 @@ class CRAP(StackingProtocol):
                         print("server iva:", self.ivA)
                         print("server ivb:", self.ivB)
 
+                        # Create hash2, encA
                         digest2 = hashes.Hash(hashes.SHA256(), backend=default_backend())
                         digest2.update(hash1)
                         hash2 = digest2.finalize()
                         self.decB = hash2[0:16]
                         print("server dec:", self.decB)
 
+                        # Create hash3, decA
                         digest3 = hashes.Hash(hashes.SHA256(), backend=default_backend())
                         digest3.update(hash2)
                         hash3 = digest3.finalize()
@@ -322,13 +341,12 @@ class CRAP(StackingProtocol):
                     snonceSignature = self.client_sign_pvk.sign(self.serialized_snonce,padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),hashes.SHA256())
                     tls_handshake_packet = HandshakePacket(status=1, nonceSignature=snonceSignature)
                     self.transport.write(tls_handshake_packet.__serialize__())
-                    # Generate shared key
+                   
                     recv_pubk = load_pem_public_key(pkt.pk, backend=default_backend())
                     self.shared_key = self.client_private_key.exchange(ec.ECDH(), recv_pubk)
 
                     print("Client TLS Handshake complete")
 
-                    # Create IV and hash1
                     digest1 = hashes.Hash(hashes.SHA256(), backend=default_backend())
                     digest1.update(self.shared_key)
                     hash1 = digest1.finalize()
@@ -337,14 +355,12 @@ class CRAP(StackingProtocol):
                     print("client iva:", self.ivA)
                     print("client ivb:", self.ivB)
 
-                    # Create hash2 and encA
                     digest2 = hashes.Hash(hashes.SHA256(), backend=default_backend())
                     digest2.update(hash1)
                     hash2 = digest2.finalize()
                     self.encA = hash2[0:16]
                     print("client enc:", self.encA)
 
-                    # Create hash3 and decA
                     digest3 = hashes.Hash(hashes.SHA256(), backend=default_backend())
                     digest3.update(hash2)
                     hash3 = digest3.finalize()
@@ -354,7 +370,7 @@ class CRAP(StackingProtocol):
                     self.higherProtocol().connection_made(self.crap_transport)
 
             if pkt.DEFINITION_IDENTIFIER == "crap.datapacket":
-                if self.mode == "server":
+                if self._mode == "server":
                     aesgcm = AESGCM(self.decB)
                     try:
                         decData = aesgcm.decrypt(self.ivA, pkt.data, None)
@@ -365,7 +381,7 @@ class CRAP(StackingProtocol):
                     self.ivA = (int.from_bytes(self.ivA, "big") + 1).to_bytes(12, "big")
                     self.higherProtocol().data_received(decData)
 
-                if self.mode == "client":
+                if self._mode == "client":
                     aesgcm = AESGCM(self.decA)
                     try:
                         decData = aesgcm.decrypt(self.ivB, pkt.data, None)
